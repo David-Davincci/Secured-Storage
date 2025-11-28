@@ -2,7 +2,7 @@ import React, { Component } from "react";
 import classNames from "classnames";
 import _ from "lodash";
 import { isEmail } from "../helpers/email";
-import { createUser, login } from "../helpers/user";
+import { login } from "../helpers/auth";
 
 export default class LoginForm extends Component {
   constructor(props) {
@@ -31,7 +31,7 @@ export default class LoginForm extends Component {
     this._formValidation = this._formValidation.bind(this);
   }
 
-  _formValidation(fieldsToValidate = [], callback = () => {}) {
+  _formValidation(fieldsToValidate = [], callback = () => { }) {
     const { isLogin, user } = this.state;
 
     const allFields = {
@@ -142,23 +142,27 @@ export default class LoginForm extends Component {
               this.setState({
                 message: {
                   type: "success",
-                  message: "Login successful.",
+                  message: "Login successful. Redirecting to dashboard...",
                 },
               });
+
+              // Redirect to dashboard after successful login
+              setTimeout(() => {
+                window.location.href = '/dashboard';
+              }, 1000);
             })
             .catch((err) => {
               this.setState({
                 message: {
                   type: "error",
-                  message: "An error login!",
+                  message: err.message || "Login failed. Please check your credentials.",
                 },
               });
               console.log(err);
             });
         } else {
-          createUser(this.state.user).then((response) => {
-            console.log("Hey i got data after send post", response);
-          });
+          // Redirect to register page for new signup
+          window.location.href = '/register';
         }
       }
     });
@@ -269,14 +273,20 @@ export default class LoginForm extends Component {
             {isLogin ? (
               <div className="app-form-actions">
                 <button className="app-button primary">Sign In</button>
+                <button
+                  type="button"
+                  onClick={() => { window.location.href = '/forgot-password'; }}
+                  className="app-button app-button-link"
+                  style={{ fontSize: '12px' }}
+                >
+                  Forgot Password?
+                </button>
                 <div className="app-form-description">
                   <div>
-                    Don't have an account ?{" "}
+                    Don't have an account?{" "}
                     <button
                       type="button"
-                      onClick={() => {
-                        this.setState({ isLogin: false });
-                      }}
+                      onClick={() => { window.location.href = '/register'; }}
                       className="app-button app-button-link"
                     >
                       Sign Up

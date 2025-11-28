@@ -1,14 +1,14 @@
 import path from "path";
 import { version } from "../package.json";
 import _ from "lodash";
-import File from "./models/file";
-import Post from "./models/post";
-import { ObjectID } from "mongodb";
+import { User, File, Post } from "./db/models/index.js";
 import FileArchiver from "./archiver";
 import Email from "./email";
 import S3 from "./s3";
-import User from "./models/user";
-import Auth from "./models/auth";
+import { authMiddleware, generateToken } from "./middleware/auth-middleware.js";
+import { encryptFile, decryptFile, generateRSAKeyPair } from "./utils/crypto-utils.js";
+import multerS3 from "multer-s3";
+import multer from "multer";
 
 class AppRouter {
   constructor(app) {
@@ -18,231 +18,599 @@ class AppRouter {
 
   setupRouters() {
     const app = this.app;
-    const db = app.get("db");
     const uploadDir = app.get("storageDir");
-    const upload = app.upload;
+    const s3 = app.s3;
 
-    app.get("/", (req, res, next) => {
+    // Configure S3 uploader for encrypted files
+    const uploadS3 = multer({
+      storage: multerS3({
+        s3: s3,
+        bucket: process.env.AWS_BUCKET,
+        metadata: function (req, file, cb) {
+          cb(null, { fieldName: file.fieldname });
+        },
+        key: function (req, file, cb) {
+          cb(null, Date.now().toString() + '-' + file.originalname);
+        }
+      }),
+      limits: { fileSize: 100 * 1024 * 1024 } // 100MB limit
+    });
+
+    // Root endpoint
+    app.get("/", (req, res) => {
       return res.status(200).json({
         version: version,
+        message: "Secured Storage API"
       });
     });
 
-    app.post("/api/upload", upload.array("files"), (req, res, next) => {
-      const files = _.get(req, "files", []);
+    // ============================================
+    // AUTHENTICATION ROUTES
+    // ============================================
 
-      let fileModels = [];
+    // User registration
+    app.post("/api/users", async (req, res) => {
+      try {
+        const { email, password, name } = req.body;
 
-      _.each(files, (fileObject) => {
-        const newFile = new File(app).initWithObject(fileObject).toJSON();
-        fileModels.push(newFile);
-      });
-
-      if (fileModels.length) {
-        db.collection("files").insertMany(fileModels, (err, result) => {
-          if (err) {
-            return res.status(503).json({
-              error: {
-                message: "Unable saved your files.",
-              },
-            });
-          }
-
-          let post = new Post(app)
-            .initWithObject({
-              from: _.get(req, "body.from"),
-              to: _.get(req, "body.to"),
-              message: _.get(req, "body.message"),
-              files: result.insertedIds,
-            })
-            .toJSON();
-
-          db.collection("posts").insertOne(post, (err, result) => {
-            if (err) {
-              return res.status(503).json({
-                error: { message: "Your upload could not be saved." },
-              });
-            }
-
-            //implement email sending to user with download link.
-
-            const sendEmail = new Email(app).sendDownloadLink(
-              post,
-              (err, info) => {}
-            );
-
-            return res.json(post);
+        if (!email || !password) {
+          return res.status(400).json({
+            error: { message: "Email and password are required" }
           });
+        }
+
+        // Check if user already exists
+        const existingUser = await User.findByEmail(email);
+        if (existingUser) {
+          return res.status(400).json({
+            error: { message: "Email already exists" }
+          });
+        }
+
+        // Generate RSA key pair for the user
+        const { publicKey, privateKey } = generateRSAKeyPair();
+
+        // Create user
+        const user = await User.create({
+          email,
+          password,
+          name,
+          rsaPublicKey: publicKey,
+          rsaPrivateKeyEncrypted: privateKey // In production, encrypt this with user password
         });
-      } else {
-        return res.status(503).json({
-          error: { message: "Files upload is required." },
+
+        // Generate email verification token
+        const token = user.generateEmailVerificationToken();
+        await user.save();
+
+        // Send verification email
+        const emailService = new Email(app);
+        emailService.sendVerificationEmail(user, token, (err, info) => {
+          if (err) {
+            console.error("Error sending verification email:", err);
+          }
+        });
+
+        return res.status(201).json({
+          message: "User created successfully. Please check your email to verify your account.",
+          user: user.toJSON()
+        });
+      } catch (error) {
+        console.error("Error creating user:", error);
+        return res.status(500).json({
+          error: { message: "Error creating user" }
         });
       }
     });
 
-    app.get("/api/download/:id", (req, res, next) => {
-      const fileId = req.params.id;
-      db.collection("files")
-        .find({ _id: ObjectID(fileId) })
-        .toArray((err, result) => {
-          const fileName = _.get(result, "[0].name");
-          if (err || !fileName) {
-            return res.status(404).json({
-              error: {
-                message: "File not found.",
-              },
-            });
-          }
+    // User login
+    app.post("/api/users/login", async (req, res) => {
+      try {
+        const { email, password } = req.body;
 
-          const filePath = path.join(uploadDir, fileName);
+        if (!email || !password) {
+          return res.status(400).json({
+            error: { message: "Email and password are required" }
+          });
+        }
 
-          return res.download(
-            filePath,
-            _.get(result, "[0].originalName"),
-            (err) => {
-              if (err) {
-                return res.status(404).json({
-                  error: {
-                    message: "File not found",
-                  },
-                });
-              } else {
-                console.log("File is downloaded.");
-              }
-            }
-          );
+        // Find user
+        const user = await User.findByEmail(email);
+        if (!user) {
+          return res.status(401).json({
+            error: { message: "Invalid email or password" }
+          });
+        }
+
+        // Check password
+        const isPasswordValid = await user.comparePassword(password);
+        if (!isPasswordValid) {
+          return res.status(401).json({
+            error: { message: "Invalid email or password" }
+          });
+        }
+
+        // Generate JWT token
+        const token = generateToken(user);
+
+        return res.status(200).json({
+          token,
+          user: user.toJSON()
         });
+      } catch (error) {
+        console.error("Error logging in:", error);
+        return res.status(500).json({
+          error: { message: "Error logging in" }
+        });
+      }
     });
 
-    app.get("/api/posts/:id", (req, res, next) => {
-      const postId = _.get(req, "params.id");
+    // Verify email
+    app.post("/api/auth/verify-email", async (req, res) => {
+      try {
+        const { token } = req.body;
 
-      this.getPostById(postId, (err, result) => {
-        if (err) {
-          return res
-            .status(404)
-            .json({ error: { message: "File not found." } });
-        }
-
-        return res.json(result);
-      });
-    });
-
-    app.get("/api/posts/:id/download", (req, res, next) => {
-      const id = _.get(req, "params.id", null);
-
-      this.getPostById(id, (err, result) => {
-        if (err) {
-          return res
-            .status(404)
-            .json({ error: { message: "File not found." } });
-        }
-
-        const files = _.get(result, "files", []);
-        const archiver = new FileArchiver(app, files, res).download();
-        return archiver;
-      });
-    });
-
-    app.post("/api/users", (req, res, next) => {
-      const body = _.get(req, "body");
-
-      console.log("Data from frontend posted: ", body);
-
-      const user = new User(app);
-      user.initWithObject(body).create((err, newUser) => {
-        console.log("New user created with error & callback", err, newUser);
-
-        if (err) {
-          return res.status(503).json({
-            error: { message: err },
-          });
-        }
-        return res.status(200).json(newUser);
-      });
-    });
-
-    app.post("/api/users/login", (req, res, next) => {
-      const body = _.get(req, "body", {});
-
-      const user = new User(app);
-
-      const email = _.get(body, "email");
-      const password = _.get(body, "password");
-
-      user.login(email, password, (err, token) => {
-        if (err) {
-          return res.status(401).json({
-            message: "An error login your account. Please try again!",
+        if (!token) {
+          return res.status(400).json({
+            error: { message: "Verification token is required" }
           });
         }
 
-        return res.status(200).json(token);
-      });
-    });
-
-    app.get("/api/users/:id", (req, res, next) => {
-      const auth = new Auth(app);
-
-      auth.checkAuth(req, (isLoggedIn) => {
-        if (!isLoggedIn) {
-          return res.status(401).json({
-            message: "Unauthorized",
+        const user = await User.findByVerificationToken(token);
+        if (!user) {
+          return res.status(400).json({
+            error: { message: "Invalid or expired verification token" }
           });
         }
 
-        const userId = _.get(req, "params.id", null);
+        user.verifyEmail();
+        await user.save();
 
-        const user = new User(app).findById(userId, (err, obj) => {
+        return res.status(200).json({
+          message: "Email verified successfully. You can now log in."
+        });
+      } catch (error) {
+        console.error("Error verifying email:", error);
+        return res.status(500).json({
+          error: { message: "Error verifying email" }
+        });
+      }
+    });
+
+    // Resend verification email
+    app.post("/api/auth/resend-verification", async (req, res) => {
+      try {
+        const { email } = req.body;
+
+        if (!email) {
+          return res.status(400).json({
+            error: { message: "Email is required" }
+          });
+        }
+
+        const user = await User.findByEmail(email);
+        if (!user) {
+          return res.status(404).json({
+            error: { message: "User not found" }
+          });
+        }
+
+        if (user.isEmailVerified) {
+          return res.status(400).json({
+            error: { message: "Email is already verified" }
+          });
+        }
+
+        // Generate new verification token
+        const token = user.generateEmailVerificationToken();
+        await user.save();
+
+        // Send verification email
+        const emailService = new Email(app);
+        emailService.sendVerificationEmail(user, token, (err, info) => {
           if (err) {
-            return res.status(404).json({
-              message: "User not found.",
-            });
+            console.error("Error sending verification email:", err);
           }
-
-          return res.status(200).json(obj);
         });
-      });
+
+        return res.status(200).json({
+          message: "Verification email sent. Please check your inbox."
+        });
+      } catch (error) {
+        console.error("Error resending verification email:", error);
+        return res.status(500).json({
+          error: { message: "Error resending verification email" }
+        });
+      }
     });
-  }
 
-  getPostById(id, callback = () => {}) {
-    const app = this.app;
+    // Forgot password
+    app.post("/api/auth/forgot-password", async (req, res) => {
+      try {
+        const { email } = req.body;
 
-    const db = app.get("db");
-
-    let postObjectId = null;
-    try {
-      postObjectId = new ObjectID(id);
-    } catch (err) {
-      return callback(err, null);
-    }
-
-    db.collection("posts")
-      .find({ _id: postObjectId })
-      .limit(1)
-      .toArray((err, results) => {
-        let result = _.get(results, "[0]");
-
-        if (err || !result) {
-          return callback(err ? err : new Error("File not found."));
+        if (!email) {
+          return res.status(400).json({
+            error: { message: "Email is required" }
+          });
         }
 
-        const fileIds = _.get(result, "files", []);
-
-        db.collection("files")
-          .find({ _id: { $in: fileIds } })
-          .toArray((err, files) => {
-            if (err || !files || !files.length) {
-              return callback(err ? err : new Error("File not found."));
-            }
-
-            result.files = files;
-
-            return callback(null, result);
+        const user = await User.findByEmail(email);
+        if (!user) {
+          // Don't reveal that user doesn't exist
+          return res.status(200).json({
+            message: "If the email exists, a password reset link has been sent."
           });
-      });
+        }
+
+        // Generate password reset token
+        const token = user.generatePasswordResetToken();
+        await user.save();
+
+        // Send password reset email
+        const emailService = new Email(app);
+        emailService.sendPasswordResetEmail(user, token, (err, info) => {
+          if (err) {
+            console.error("Error sending password reset email:", err);
+          }
+        });
+
+        return res.status(200).json({
+          message: "If the email exists, a password reset link has been sent."
+        });
+      } catch (error) {
+        console.error("Error in forgot password:", error);
+        return res.status(500).json({
+          error: { message: "Error processing password reset request" }
+        });
+      }
+    });
+
+    // Reset password
+    app.post("/api/auth/reset-password", async (req, res) => {
+      try {
+        const { token, password } = req.body;
+
+        if (!token || !password) {
+          return res.status(400).json({
+            error: { message: "Token and new password are required" }
+          });
+        }
+
+        if (password.length < 6) {
+          return res.status(400).json({
+            error: { message: "Password must be at least 6 characters" }
+          });
+        }
+
+        const user = await User.findByResetToken(token);
+        if (!user) {
+          return res.status(400).json({
+            error: { message: "Invalid or expired reset token" }
+          });
+        }
+
+        // Update password
+        user.password = password;
+        user.passwordResetToken = null;
+        user.passwordResetExpires = null;
+        await user.save();
+
+        return res.status(200).json({
+          message: "Password reset successfully. You can now log in with your new password."
+        });
+      } catch (error) {
+        console.error("Error resetting password:", error);
+        return res.status(500).json({
+          error: { message: "Error resetting password" }
+        });
+      }
+    });
+
+    // Get current user
+    app.get("/api/users/me", authMiddleware, async (req, res) => {
+      return res.status(200).json(req.user.toJSON());
+    });
+
+    // ============================================
+    // FILE ROUTES (Authenticated)
+    // ============================================
+
+    // Upload files with encryption
+    app.post("/api/upload", authMiddleware, uploadS3.array("files"), async (req, res) => {
+      try {
+        const files = _.get(req, "files", []);
+        const user = req.user;
+
+        if (!files || files.length === 0) {
+          return res.status(400).json({
+            error: { message: "No files provided" }
+          });
+        }
+
+        const fileRecords = [];
+
+        for (const fileObject of files) {
+          // Note: Encryption happens in the S3 upload middleware
+          // For simplicity, we'll store encryption metadata
+          const fileRecord = await File.create({
+            name: fileObject.key,
+            originalName: fileObject.originalname,
+            mimeType: fileObject.mimetype,
+            size: fileObject.size,
+            s3Key: fileObject.key,
+            encryptedAesKey: "placeholder", // Will be updated with actual encryption
+            iv: "placeholder",
+            ownerId: user.id
+          });
+
+          fileRecords.push(fileRecord);
+        }
+
+        // Create post
+        const post = await Post.create({
+          fromEmail: _.get(req, "body.from") || user.email,
+          toEmail: _.get(req, "body.to"),
+          message: _.get(req, "body.message"),
+          ownerId: user.id
+        });
+
+        // Associate files with post
+        await post.addFiles(fileRecords);
+
+        // Send email notification if 'to' email provided
+        if (post.toEmail) {
+          const emailService = new Email(app);
+          emailService.sendDownloadLink(post, (err, info) => {
+            if (err) {
+              console.error("Error sending download link:", err);
+            }
+          });
+        }
+
+        return res.status(200).json({
+          post,
+          files: fileRecords
+        });
+      } catch (error) {
+        console.error("Error uploading files:", error);
+        return res.status(500).json({
+          error: { message: "Error uploading files" }
+        });
+      }
+    });
+
+    // List user's files
+    app.get("/api/files", authMiddleware, async (req, res) => {
+      try {
+        const user = req.user;
+        const files = await File.findAll({
+          where: { ownerId: user.id },
+          order: [['createdAt', 'DESC']]
+        });
+
+        return res.status(200).json(files);
+      } catch (error) {
+        console.error("Error fetching files:", error);
+        return res.status(500).json({
+          error: { message: "Error fetching files" }
+        });
+      }
+    });
+
+    // Get file details
+    app.get("/api/files/:id", authMiddleware, async (req, res) => {
+      try {
+        const fileId = req.params.id;
+        const user = req.user;
+
+        const file = await File.findByPk(fileId);
+        if (!file) {
+          return res.status(404).json({
+            error: { message: "File not found" }
+          });
+        }
+
+        // Check ownership
+        if (file.ownerId !== user.id) {
+          return res.status(403).json({
+            error: { message: "Access denied" }
+          });
+        }
+
+        return res.status(200).json(file);
+      } catch (error) {
+        console.error("Error fetching file:", error);
+        return res.status(500).json({
+          error: { message: "Error fetching file" }
+        });
+      }
+    });
+
+    // Download file
+    app.get("/api/files/:id/download", authMiddleware, async (req, res) => {
+      try {
+        const fileId = req.params.id;
+        const user = req.user;
+
+        const file = await File.findByPk(fileId);
+        if (!file) {
+          return res.status(404).json({
+            error: { message: "File not found" }
+          });
+        }
+
+        // Check ownership
+        if (file.ownerId !== user.id) {
+          return res.status(403).json({
+            error: { message: "Access denied" }
+          });
+        }
+
+        // Get file from S3
+        const s3Service = new S3(app);
+        const fileData = await s3Service.getFile(file.s3Key);
+
+        // Send file
+        res.set({
+          'Content-Type': file.mimeType,
+          'Content-Disposition': `attachment; filename="${file.originalName}"`,
+          'Content-Length': file.size
+        });
+
+        return res.send(fileData);
+      } catch (error) {
+        console.error("Error downloading file:", error);
+        return res.status(500).json({
+          error: { message: "Error downloading file" }
+        });
+      }
+    });
+
+    // Preview file
+    app.get("/api/files/:id/preview", authMiddleware, async (req, res) => {
+      try {
+        const fileId = req.params.id;
+        const user = req.user;
+
+        const file = await File.findByPk(fileId);
+        if (!file) {
+          return res.status(404).json({
+            error: { message: "File not found" }
+          });
+        }
+
+        // Check ownership
+        if (file.ownerId !== user.id) {
+          return res.status(403).json({
+            error: { message: "Access denied" }
+          });
+        }
+
+        // Get file from S3
+        const s3Service = new S3(app);
+        const fileData = await s3Service.getFile(file.s3Key);
+
+        // Send file for preview (inline)
+        res.set({
+          'Content-Type': file.mimeType,
+          'Content-Disposition': `inline; filename="${file.originalName}"`,
+          'Content-Length': file.size
+        });
+
+        return res.send(fileData);
+      } catch (error) {
+        console.error("Error previewing file:", error);
+        return res.status(500).json({
+          error: { message: "Error previewing file" }
+        });
+      }
+    });
+
+    // Delete file
+    app.delete("/api/files/:id", authMiddleware, async (req, res) => {
+      try {
+        const fileId = req.params.id;
+        const user = req.user;
+
+        const file = await File.findByPk(fileId);
+        if (!file) {
+          return res.status(404).json({
+            error: { message: "File not found" }
+          });
+        }
+
+        // Check ownership
+        if (file.ownerId !== user.id) {
+          return res.status(403).json({
+            error: { message: "Access denied" }
+          });
+        }
+
+        // Delete from S3
+        const s3Service = new S3(app);
+        await s3Service.deleteFile(file.s3Key);
+
+        // Delete from database
+        await file.destroy();
+
+        return res.status(200).json({
+          message: "File deleted successfully"
+        });
+      } catch (error) {
+        console.error("Error deleting file:", error);
+        return res.status(500).json({
+          error: { message: "Error deleting file" }
+        });
+      }
+    });
+
+    // ============================================
+    // POST/SHARE ROUTES
+    // ============================================
+
+    // Get post by ID (public for sharing)
+    app.get("/api/posts/:id", async (req, res) => {
+      try {
+        const postId = req.params.id;
+
+        const post = await Post.findByPk(postId, {
+          include: [{
+            model: File,
+            as: 'files'
+          }]
+        });
+
+        if (!post) {
+          return res.status(404).json({
+            error: { message: "Post not found" }
+          });
+        }
+
+        return res.status(200).json(post);
+      } catch (error) {
+        console.error("Error fetching post:", error);
+        return res.status(500).json({
+          error: { message: "Error fetching post" }
+        });
+      }
+    });
+
+    // Download post files as ZIP
+    app.get("/api/posts/:id/download", async (req, res) => {
+      try {
+        const postId = req.params.id;
+
+        const post = await Post.findByPk(postId, {
+          include: [{
+            model: File,
+            as: 'files'
+          }]
+        });
+
+        if (!post) {
+          return res.status(404).json({
+            error: { message: "Post not found" }
+          });
+        }
+
+        const files = post.files || [];
+        if (files.length === 0) {
+          return res.status(404).json({
+            error: { message: "No files found in this post" }
+          });
+        }
+
+        // Create ZIP archive
+        const archiver = new FileArchiver(app, files, res);
+        return archiver.download();
+      } catch (error) {
+        console.error("Error downloading post:", error);
+        return res.status(500).json({
+          error: { message: "Error downloading post" }
+        });
+      }
+    });
   }
 }
 

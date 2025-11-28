@@ -8,7 +8,8 @@ import bodyParser from "body-parser";
 import multer from "multer";
 import path from "path";
 
-import { connect } from "./database";
+import sequelize, { connectDB } from "./db/database.js";
+import { User, File, Post } from "./db/models/index.js";
 import AppRouter from "./router";
 import nodemailer from "nodemailer";
 import { smtp, s3Config, s3Region, s3Bucket } from "./config";
@@ -17,7 +18,6 @@ import AWS from "aws-sdk";
 import multerS3 from "multer-s3";
 
 AWS.config.update(s3Config);
-
 AWS.config.region = s3Region;
 
 const s3 = new AWS.S3();
@@ -60,20 +60,28 @@ app.upload = upload;
 app.email = email;
 app.s3 = s3;
 
-connect((err, db) => {
-  if (err) {
-    console.log("An error connecting to the database", err);
-    throw err;
-  }
+// Connect to PostgreSQL and sync models
+connectDB()
+  .then(async (db) => {
+    console.log("PostgreSQL database connected successfully");
 
-  app.db = db;
-  app.set("db", db);
+    // Sync models (create tables if they don't exist)
+    // In production, use migrations instead
+    await sequelize.sync({ alter: process.env.NODE_ENV === 'development' });
+    console.log("Database models synchronized");
 
-  new AppRouter(app);
+    app.db = sequelize;
+    app.set("db", sequelize);
 
-  app.server.listen(process.env.PORT || PORT, () => {
-    console.log(`App is running on port ${app.server.address().port}`);
+    new AppRouter(app);
+
+    app.server.listen(process.env.PORT || PORT, () => {
+      console.log(`App is running on port ${app.server.address().port}`);
+    });
+  })
+  .catch((err) => {
+    console.error("Database connection error:", err);
+    process.exit(1);
   });
-});
 
 export default app;
